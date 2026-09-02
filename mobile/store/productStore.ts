@@ -47,11 +47,41 @@ function patchCategoryTree(categories: Category[], event: SyncEvent): Category[]
   return changed ? next : categories;
 }
 
+// `version` is a per-entity optimistic-concurrency counter (DEFAULT 1 in the
+// DB schema), not a shared/global sequence — every row starts independently
+// at 1 and only advances via its own bumps. `GET /sync?since=` compares this
+// single scalar directly against each table's `version` column
+// (`WHERE version > ?`), using the SAME `since` for products/categories/tags.
+// That makes `since` a "floor": the query is only guaranteed complete (no
+// missed changes) for a table if `since` is <= the lowest version currently
+// known locally in that table. Concretely: if a /sync response contains
+// product A at v5 and product B at v3, setting since = max(5, 3) = 5 is
+// UNSAFE — if B is later bumped in isolation to v4, the next
+// `/sync?since=5` query evaluates `4 > 5 = false` and silently drops B's
+// change forever. Setting since = min(...) instead (here, 3) is always safe:
+// it can only make the next response broader (re-includes entities already
+// known, which the version guard below no-ops), never narrower than what's
+// needed to cover every locally-held entity.
+function computeSyncFloor(products: Product[], categories: Category[], tags: Tag[]): number {
+  let min = Infinity;
+  for (const p of products) if (p.version < min) min = p.version;
+  for (const t of tags) if (t.version < min) min = t.version;
+  const walk = (cats: Category[]) => {
+    for (const c of cats) {
+      if (c.version < min) min = c.version;
+      if (c.children && c.children.length > 0) walk(c.children);
+    }
+  };
+  walk(categories);
+  return min === Infinity ? 0 : min;
+}
+
 interface ProductState {
   products: Product[];
   categories: Category[];
   tags: Tag[];
   isLoading: boolean;
+  isSyncing: boolean;
   nextCursor: string | null;
   lastSyncVersion: number;
   error: string | null;
@@ -62,6 +92,7 @@ interface ProductState {
   bumpProduct: (id: number, expectedVersion: number) => Promise<void>;
   applySync: (response: SyncResponse) => void;
   applyEntityEvent: (event: SyncEvent) => void;
+  syncSince: () => Promise<void>;
 }
 
 export const useProductStore = create<ProductState>((set, get) => ({
@@ -69,6 +100,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
   categories: [],
   tags: [],
   isLoading: false,
+  isSyncing: false,
   nextCursor: null,
   lastSyncVersion: 0,
   error: null,
@@ -82,6 +114,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
         nextCursor: response.next_cursor,
         isLoading: false,
       });
+      set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
     } catch (e) {
       set({ isLoading: false, error: 'Failed to load products' });
     }
@@ -98,6 +131,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
         nextCursor: response.next_cursor,
         isLoading: false,
       });
+      set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
     } catch (e) {
       set({ isLoading: false });
     }
@@ -107,6 +141,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
     try {
       const categories = await api.getCategories();
       set({ categories });
+      set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
     } catch (e) {
       set({ error: 'Failed to load categories' });
     }
@@ -116,6 +151,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
     try {
       const tags = await api.getTags();
       set({ tags });
+      set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
     } catch (e) {
       set({ error: 'Failed to load tags' });
     }
@@ -134,16 +170,33 @@ export const useProductStore = create<ProductState>((set, get) => ({
     }
   },
 
+  // Applies an already-fetched /sync response: patches every changed entity
+  // via the same applyEntityEvent used for WS events (single merge code
+  // path, so a v6 arriving over /sync is guarded against downgrading a v7
+  // already applied from WS, and vice versa), then recomputes the cursor
+  // floor from the now-reconciled local state. Recomputing (rather than
+  // trusting response.version values directly) is what makes it safe to
+  // advance the floor here: after this call, every locally-held entity is
+  // known to match backend truth as of the query, so min(local versions) is
+  // a provably safe next `since`.
   applySync: (response: SyncResponse) => {
     const allEvents: SyncEvent[] = [
       ...response.products,
       ...response.categories,
       ...response.tags,
     ];
-    const maxVersion = allEvents.reduce((max, e) => Math.max(max, e.version), get().lastSyncVersion);
-    set({ lastSyncVersion: maxVersion });
+    for (const event of allEvents) {
+      get().applyEntityEvent(event);
+    }
+    set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
   },
 
+  // A single WS event only describes ONE entity — it says nothing about
+  // whether other locally-held entities have also changed, so it must never
+  // move the sync cursor (see computeSyncFloor comment above for the
+  // concrete missed-update scenario this avoids). The cursor only ever
+  // advances from a complete source of truth: a fresh load or a full /sync
+  // reconciliation (applySync).
   applyEntityEvent: (event: SyncEvent) => {
     switch (event.type) {
       case 'product_bump': {
@@ -164,9 +217,26 @@ export const useProductStore = create<ProductState>((set, get) => ({
       default:
         break;
     }
+  },
 
-    if (event.version > get().lastSyncVersion) {
-      set({ lastSyncVersion: event.version });
+  // Fetches the missed-change delta and applies it. Guarded by `isSyncing`
+  // so concurrent triggers (WS reconnect + app foreground + NetInfo
+  // online firing together) collapse into a single in-flight request
+  // instead of racing duplicate /sync calls — any trigger that arrives
+  // while one is in flight is redundant, since the in-flight call already
+  // covers the same `since` floor and will bring local state fully current
+  // when it resolves.
+  syncSince: async () => {
+    if (get().isSyncing) return;
+    set({ isSyncing: true });
+    try {
+      const response = await api.getSync(get().lastSyncVersion);
+      get().applySync(response);
+    } catch (e) {
+      // Leave lastSyncVersion untouched on failure so the next trigger
+      // retries from the same safe floor instead of skipping ahead.
+    } finally {
+      set({ isSyncing: false });
     }
   },
 }));

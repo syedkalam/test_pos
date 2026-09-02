@@ -6,6 +6,7 @@ import { SearchBar } from '@/components/SearchBar';
 import { useProducts } from '@/hooks/useProducts';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useAppState } from '@/hooks/useAppState';
+import { useNetworkStatus } from '@/hooks/useNetworkStatus';
 import { useCartStore } from '@/store/cartStore';
 import { useProductStore } from '@/store/productStore';
 import type { Product, SyncEvent } from '@/types';
@@ -15,6 +16,7 @@ export default function ProductsScreen() {
   const { products, isLoading, nextCursor, loadNextPage } = useProducts();
   const addItem = useCartStore((s) => s.addItem);
   const applyEntityEvent = useProductStore((s) => s.applyEntityEvent);
+  const syncSince = useProductStore((s) => s.syncSince);
   const [searchResults, setSearchResults] = useState<Product[] | null>(null);
 
   const displayProducts = searchResults ?? products;
@@ -34,13 +36,19 @@ export default function ProductsScreen() {
     [applyEntityEvent]
   );
 
-  useWebSocket(handleSyncEvent);
+  // Missed-change reconciliation: fired on WS reconnect (messages broadcast
+  // while disconnected were never delivered), app foreground (the socket
+  // may have been suspended by the OS while backgrounded), and offline ->
+  // online. All three funnel into the same store action, which guards
+  // against overlapping /sync calls if they fire together.
+  useWebSocket(handleSyncEvent, syncSince);
 
   const handleForeground = useCallback(() => {
-    // foreground resume
-  }, []);
+    syncSince();
+  }, [syncSince]);
 
   useAppState(handleForeground);
+  useNetworkStatus(syncSince);
 
   const handleEndReached = useCallback(() => {
     if (!searchResults) loadNextPage();
