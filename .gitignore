@@ -1,2 +1,48 @@
-/node_modules
+# Dependencies
+node_modules/
 /dist
+
+# Go
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
+# Expo / React Native
+mobile/.expo/
+mobile/.expo-shared/
+mobile/web-build/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+*.pem
+
+# Metro
+.metro-health-check*
+
+# Native build artifacts
+mobile/android/
+mobile/ios/
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Logs
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# TypeScript
+*.tsbuildinfo
