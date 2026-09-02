@@ -2,17 +2,22 @@ import React, { useEffect, useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { api } from '@/services/api';
+import { useCartStore } from '@/store/cartStore';
 import type { Order } from '@/types';
 
 export default function OrderDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  const deviceId = useCartStore((s) => s.deviceId);
   const [order, setOrder] = useState<Order | null>(null);
   const [loading, setLoading] = useState(true);
   const [paying, setPaying] = useState(false);
 
+  // Scope to the current device, same as the Orders list — an unscoped
+  // api.getOrders() call here would fetch every device's orders just to find
+  // one by id.
   const loadOrder = async () => {
     try {
-      const orders = await api.getOrders();
+      const orders = await api.getOrders(deviceId);
       const found = orders.find((o) => o.id === Number(id));
       setOrder(found ?? null);
     } finally {
@@ -20,7 +25,9 @@ export default function OrderDetailScreen() {
     }
   };
 
-  useEffect(() => { loadOrder(); }, [id]);
+  useEffect(() => {
+    if (deviceId) loadOrder();
+  }, [id, deviceId]);
 
   const handlePay = async () => {
     if (!order) return;

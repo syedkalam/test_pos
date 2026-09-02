@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+import { useFocusEffect } from 'expo-router';
 import { api } from '@/services/api';
 import { useCartStore } from '@/store/cartStore';
 import type { Order } from '@/types';
@@ -17,9 +18,16 @@ export default function OrdersScreen() {
     }
   };
 
-  useEffect(() => {
-    if (deviceId) loadOrders();
-  }, [deviceId]);
+  // Expo Router keeps tab screens mounted after their first visit, so a
+  // mount-only effect never re-fires for an order placed after this screen
+  // was first shown (e.g. visited Orders, then Cart -> Place Order, then back
+  // to Orders) — the list stays stuck on the stale response. Refetching on
+  // every focus (real server call, not local fabrication) fixes that.
+  useFocusEffect(
+    useCallback(() => {
+      if (deviceId) loadOrders();
+    }, [deviceId])
+  );
 
   const handlePay = async (orderId: number) => {
     try {

@@ -1,32 +1,25 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, Image, ScrollView, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
-import { useLocalSearchParams, useRouter } from 'expo-router';
-import { api } from '@/services/api';
+import React from 'react';
+import { View, Text, Image, ScrollView, TouchableOpacity, StyleSheet } from 'react-native';
+import { useLocalSearchParams } from 'expo-router';
 import { useProductStore } from '@/store/productStore';
 import { useCartStore } from '@/store/cartStore';
-import type { Product } from '@/types';
 
 export default function ProductDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const router = useRouter();
-  const [product, setProduct] = useState<Product | null>(null);
-  const [loading, setLoading] = useState(true);
   const bumpProduct = useProductStore((s) => s.bumpProduct);
+  // productStore already owns the product catalog and is kept current by
+  // WS/`/sync` (see productStore.applyEntityEvent), so this selector re-renders
+  // live on a version bump — no separate fetch/state needed here. There is no
+  // GET /products/:id endpoint on the backend; the previous implementation
+  // called one and always got a 404.
+  const product = useProductStore((s) => s.products.find((p) => p.id === Number(id)));
   const addItem = useCartStore((s) => s.addItem);
-
-  useEffect(() => {
-    api.getProduct(Number(id))
-      .then(setProduct)
-      .catch(() => Alert.alert('Error', 'Product not found'))
-      .finally(() => setLoading(false));
-  }, [id]);
 
   const handleBump = () => {
     if (!product) return;
     bumpProduct(product.id, product.version);
   };
 
-  if (loading) return <ActivityIndicator style={{ flex: 1 }} />;
   if (!product) return <Text style={styles.error}>Product not found</Text>;
 
   return (

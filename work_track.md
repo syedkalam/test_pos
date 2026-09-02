@@ -30,3 +30,5 @@
   But thinking if this can fail in cases!!
   Yes last sync system has drawbacks, ideally our backend could have had a tiemstamp based system!
 -
+
+- Fixed  orders and cart bugs n prod details
