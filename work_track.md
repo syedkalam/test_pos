@@ -1,2 +1,2 @@
 - run code locally
--
+- Audit current implementation of the code and identify any potential issues or areas for improvement. - done
