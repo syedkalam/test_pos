@@ -1,0 +1,11 @@
+{
+  "expo": {
+    "name": "surat-mobile",
+    "slug": "surat-mobile",
+    "version": "1.0.0",
+    "orientation": "landscape",
+    "scheme": "surat",
+    "platforms": ["ios", "android"],
+    "plugins": ["expo-router"]
+  }
+}
