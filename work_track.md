@@ -16,4 +16,4 @@
 
 -  Added full socket  flow , now manually testing if we are receving latest products and updates from the server, and if the app is sending updates to the server when products are updated in the app.  
 
-
+- Question: How wil lapp know how many new products we updated since our app went offline.
