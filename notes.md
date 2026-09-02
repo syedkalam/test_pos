@@ -31,3 +31,18 @@
 - Fix: Orders now refetches via `useFocusEffect` every time the tab regains focus, so returning
   from Cart after placing an order shows it. `order/[id]` had the same device-scoping gap as the
   earlier audit noted (it called `getOrders()` unscoped) — fixed to filter by device id too.
+
+## Offline catalog cache
+
+- Persisted: `products`, `categories`, `tags` arrays to AsyncStorage (`surat_catalog_cache_v1`).
+  The sync floor is not persisted separately — it's recomputed from the cached entities on
+  hydration, so there's one source of truth for it, not two.
+- Startup: hydrate cache first and render it immediately if present, then run a silent
+  `syncSince()` catch-up in the background (no full reload). No cache (first install) falls back
+  to the normal full load.
+- Recovery: reuses the existing Task 3 sync flow as-is (WS reconnect / foreground / online), so
+  there's a single refresh path whether it's triggered by cache hydration or reconnection. WS/
+  sync updates also refresh the persisted cache.
+- Trade-off: writes are debounced (~1.5s) so a burst of WS bumps collapses into one write instead
+  of one per bump. If the app is killed inside that window, the last update(s) may not be on disk
+  yet — acceptable, since `syncSince()` re-fetches anything missed on next launch/reconnect.
