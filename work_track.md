@@ -32,3 +32,11 @@
 -
 
 - Fixed  orders and cart bugs n prod details
+
+- Now need to implement offline cache and sync for products, categories and tags, and also implement conflict resolution for products, categories and tags.
+// I can already htink of points of failure,  eg: if losts of data is out of syn and user sleects a prod and places order,
+
+we might need a strategy to get a quick list of products that may haev stale values, and then before user goes to description of the porduct we need to get latest data,
+
+
+- 
