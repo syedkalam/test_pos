@@ -2,21 +2,13 @@ import { useEffect } from 'react';
 import { useProductStore } from '@/store/productStore';
 
 export function useProducts() {
-  const {
-    products,
-    isLoading,
-    nextCursor,
-    loadProducts,
-    loadNextPage,
-    loadCategories,
-  } = useProductStore();
+  const { products, isLoading, hydrated, nextCursor, initialize, loadNextPage } = useProductStore();
 
   useEffect(() => {
-    loadProducts();
-    loadCategories();
+    initialize();
   }, []);
 
-  return { products, isLoading, nextCursor, loadNextPage };
+  return { products, isLoading, hydrated, nextCursor, loadNextPage };
 }
 
 export function useProductSearch() {

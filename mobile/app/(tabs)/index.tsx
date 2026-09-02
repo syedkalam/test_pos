@@ -13,10 +13,11 @@ import type { Product, SyncEvent } from '@/types';
 
 export default function ProductsScreen() {
   const router = useRouter();
-  const { products, isLoading, nextCursor, loadNextPage } = useProducts();
+  const { products, isLoading, hydrated, nextCursor, loadNextPage } = useProducts();
   const addItem = useCartStore((s) => s.addItem);
   const applyEntityEvent = useProductStore((s) => s.applyEntityEvent);
   const syncSince = useProductStore((s) => s.syncSince);
+  const isSyncing = useProductStore((s) => s.isSyncing);
   const [searchResults, setSearchResults] = useState<Product[] | null>(null);
 
   const displayProducts = searchResults ?? products;
@@ -64,23 +65,37 @@ export default function ProductsScreen() {
   return (
     <View style={styles.container}>
       <SearchBar onResults={(r) => setSearchResults(r.length > 0 ? r : null)} />
-      {isLoading && products.length === 0 ? (
+      {/* Before hydration completes we don't yet know if there's a cached
+          catalog to show, so hold the spinner rather than flash an empty
+          list; a cache hit and the no-cache/first-install load both clear
+          this the same way once there's something (or definitively nothing)
+          to render. */}
+      {!hydrated || (isLoading && products.length === 0) ? (
         <ActivityIndicator size="large" color="#1976d2" style={styles.loader} />
       ) : (
-        <FlatList
-          data={displayProducts}
-          renderItem={({ item }) => (
-            <ProductCard
-              product={item}
-              onPress={(p) => router.push(`/product/${p.id}`)}
-              onAddToCart={handleAddToCart}
-            />
+        <>
+          {isSyncing && products.length > 0 && (
+            <Text style={styles.syncBanner}>Syncing latest changes…</Text>
           )}
-          onEndReached={handleEndReached}
-          onEndReachedThreshold={0.3}
-          ListFooterComponent={isLoading ? <ActivityIndicator color="#1976d2" /> : null}
-          contentContainerStyle={styles.list}
-        />
+          <FlatList
+            data={displayProducts}
+            renderItem={({ item }) => (
+              <ProductCard
+                product={item}
+                onPress={(p) => router.push(`/product/${p.id}`)}
+                onAddToCart={handleAddToCart}
+              />
+            )}
+            onEndReached={handleEndReached}
+            onEndReachedThreshold={0.3}
+            ListFooterComponent={isLoading ? <ActivityIndicator color="#1976d2" /> : null}
+            // A failed background refresh (e.g. offline) never clears
+            // `products`, so this only shows for a genuinely empty catalog —
+            // first install with no network, not a fabricated error state.
+            ListEmptyComponent={<Text style={styles.empty}>No products available. Check your connection.</Text>}
+            contentContainerStyle={styles.list}
+          />
+        </>
       )}
     </View>
   );
@@ -90,4 +105,6 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f5f5f5', padding: 12 },
   list: { paddingBottom: 20 },
   loader: { flex: 1 },
+  syncBanner: { textAlign: 'center', color: '#1976d2', fontSize: 12, paddingVertical: 6 },
+  empty: { textAlign: 'center', color: '#9e9e9e', marginTop: 40, fontSize: 16 },
 });

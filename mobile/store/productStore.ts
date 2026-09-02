@@ -76,15 +76,79 @@ function computeSyncFloor(products: Product[], categories: Category[], tags: Tag
   return min === Infinity ? 0 : min;
 }
 
+// --- Offline catalog cache (AsyncStorage) ---
+// Persists exactly the entity arrays needed to redraw the last known catalog
+// and to recompute a safe sync floor on next launch (see computeSyncFloor
+// above) — nothing else. `lastSyncVersion` itself is intentionally NOT
+// persisted; it's cheap to recompute from the cached entities via
+// computeSyncFloor, which avoids a second on-disk source of truth for the
+// cursor that could drift from the entities it's supposed to describe.
+const CATALOG_CACHE_KEY = 'surat_catalog_cache_v1';
+const PERSIST_DEBOUNCE_MS = 1500;
+
+interface CachedCatalog {
+  products: Product[];
+  categories: Category[];
+  tags: Tag[];
+}
+
+async function readCachedCatalog(): Promise<CachedCatalog | null> {
+  try {
+    const raw = await AsyncStorage.getItem(CATALOG_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed?.products) || !Array.isArray(parsed?.categories) || !Array.isArray(parsed?.tags)) {
+      return null;
+    }
+    return parsed as CachedCatalog;
+  } catch {
+    // Corrupt/unreadable cache is treated the same as no cache — the
+    // first-install (full load) path below handles it cleanly.
+    return null;
+  }
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+// A single WS bump, or a burst of them, patches the in-memory arrays one
+// entity at a time. Writing the full ~5k-product payload to AsyncStorage on
+// every individual bump would be excessive I/O for a POS device. Debouncing
+// collapses a burst into a single write of the latest state a short while
+// after the last change. Trade-off: if the app is killed inside the debounce
+// window, the last update(s) may not have reached disk — acceptable here
+// because they were never lost from the *server's* point of view, and
+// syncSince() (see below) safely re-fetches anything the cache missed on the
+// next launch or reconnect, using the same conservative floor.
+function schedulePersist(products: Product[], categories: Category[], tags: Tag[]) {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    AsyncStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify({ products, categories, tags })).catch(() => {});
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+// Used after a deliberate full/paginated load (not a bursty WS patch) —
+// these are infrequent enough that writing immediately is fine, and doing so
+// keeps the cache from lagging behind an explicit user-visible refresh.
+function persistNow(products: Product[], categories: Category[], tags: Tag[]) {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  AsyncStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify({ products, categories, tags })).catch(() => {});
+}
+
 interface ProductState {
   products: Product[];
   categories: Category[];
   tags: Tag[];
   isLoading: boolean;
   isSyncing: boolean;
+  hydrated: boolean;
   nextCursor: string | null;
   lastSyncVersion: number;
   error: string | null;
+  initialize: () => Promise<void>;
   loadProducts: () => Promise<void>;
   loadNextPage: () => Promise<void>;
   loadCategories: () => Promise<void>;
@@ -101,9 +165,40 @@ export const useProductStore = create<ProductState>((set, get) => ({
   tags: [],
   isLoading: false,
   isSyncing: false,
+  hydrated: false,
   nextCursor: null,
   lastSyncVersion: 0,
   error: null,
+
+  // Single startup entry point: check for a cached catalog before making any
+  // network call. A cache hit renders immediately and only needs a delta
+  // catch-up (syncSince, reused as-is from Task 3 — no separate refresh
+  // path); a cache miss (first install, or a corrupt/empty cache) has no
+  // usable local baseline, so it falls back to the full paginated load.
+  initialize: async () => {
+    if (get().hydrated) return;
+    const cached = await readCachedCatalog();
+    // Guard against a race with live data: if products/categories/tags are
+    // no longer empty (e.g. a WS event or another load already landed while
+    // this AsyncStorage read was in flight), the cache is stale by
+    // definition — never let it overwrite newer in-memory state.
+    const isPristine =
+      get().products.length === 0 && get().categories.length === 0 && get().tags.length === 0;
+
+    if (cached && cached.products.length > 0 && isPristine) {
+      set({
+        products: cached.products,
+        categories: cached.categories,
+        tags: cached.tags,
+        lastSyncVersion: computeSyncFloor(cached.products, cached.categories, cached.tags),
+        hydrated: true,
+      });
+      get().syncSince();
+    } else {
+      set({ hydrated: true });
+      await Promise.all([get().loadProducts(), get().loadCategories(), get().loadTags()]);
+    }
+  },
 
   loadProducts: async () => {
     set({ isLoading: true, error: null });
@@ -115,6 +210,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
         isLoading: false,
       });
       set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
+      persistNow(get().products, get().categories, get().tags);
     } catch (e) {
       set({ isLoading: false, error: 'Failed to load products' });
     }
@@ -132,6 +228,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
         isLoading: false,
       });
       set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
+      persistNow(get().products, get().categories, get().tags);
     } catch (e) {
       set({ isLoading: false });
     }
@@ -142,6 +239,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
       const categories = await api.getCategories();
       set({ categories });
       set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
+      persistNow(get().products, get().categories, get().tags);
     } catch (e) {
       set({ error: 'Failed to load categories' });
     }
@@ -152,6 +250,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
       const tags = await api.getTags();
       set({ tags });
       set({ lastSyncVersion: computeSyncFloor(get().products, get().categories, get().tags) });
+      persistNow(get().products, get().categories, get().tags);
     } catch (e) {
       set({ error: 'Failed to load tags' });
     }
@@ -165,6 +264,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
           p.id === id ? { ...p, version: result.version } : p
         ),
       }));
+      schedulePersist(get().products, get().categories, get().tags);
     } catch (e) {
       console.error('Bump failed', e);
     }
@@ -201,17 +301,26 @@ export const useProductStore = create<ProductState>((set, get) => ({
     switch (event.type) {
       case 'product_bump': {
         const products = patchVersioned(get().products, event);
-        if (products !== get().products) set({ products });
+        if (products !== get().products) {
+          set({ products });
+          schedulePersist(get().products, get().categories, get().tags);
+        }
         break;
       }
       case 'tag_bump': {
         const tags = patchVersioned(get().tags, event);
-        if (tags !== get().tags) set({ tags });
+        if (tags !== get().tags) {
+          set({ tags });
+          schedulePersist(get().products, get().categories, get().tags);
+        }
         break;
       }
       case 'category_bump': {
         const categories = patchCategoryTree(get().categories, event);
-        if (categories !== get().categories) set({ categories });
+        if (categories !== get().categories) {
+          set({ categories });
+          schedulePersist(get().products, get().categories, get().tags);
+        }
         break;
       }
       default:
