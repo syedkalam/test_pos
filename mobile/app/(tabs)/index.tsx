@@ -19,13 +19,17 @@ export default function ProductsScreen() {
 
   const displayProducts = searchResults ?? products;
 
-  useWebSocket((event: SyncEvent) => {
+  const handleSyncEvent = useCallback((event: SyncEvent) => {
     console.log('sync event', event);
-  });
+  }, []);
 
-  useAppState(() => {
+  useWebSocket(handleSyncEvent);
+
+  const handleForeground = useCallback(() => {
     // foreground resume
-  });
+  }, []);
+
+  useAppState(handleForeground);
 
   const handleEndReached = useCallback(() => {
     if (!searchResults) loadNextPage();

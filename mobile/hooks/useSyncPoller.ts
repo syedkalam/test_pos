@@ -18,6 +18,10 @@ export function useSyncPoller(
     };
 
     poll();
-    setInterval(poll, POLL_INTERVAL_MS);
+    const intervalId = setInterval(poll, POLL_INTERVAL_MS);
+
+    return () => {
+      clearInterval(intervalId);
+    };
   }, [sinceVersion]);
 }
