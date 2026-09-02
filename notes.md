@@ -75,3 +75,72 @@ on top of this foundation.
   (mount/unmount/remount cycles) and runtime inspection of listener/socket counts were not
   performed — verification here is limited to static type-checking and successful bundling, not
   an observed runtime confirmation.
+
+## mobile/ — real-time entity synchronization (2026-09-02)
+
+Scope: store/productStore.ts, app/(tabs)/index.tsx. WebSocket reconnect/backoff, offline
+persistence, an outbox, and 409 conflict resolution are NOT implemented here — this pass only
+makes incoming WS entity-bump events actually update local state, without a full catalog reload.
+
+### Previous broken flow
+
+`useWebSocket`'s `onMessage` callback in `app/(tabs)/index.tsx` only called
+`console.log('sync event', event)`. The store already had an `applySync` action, but it only
+tracked `lastSyncVersion` — it never patched `products`/`categories`/`tags`, and it was never
+called from the WebSocket path at all. So incoming `product_bump` / `category_bump` / `tag_bump`
+events had zero effect on what was rendered.
+
+### Design decision: local patch vs. refetch
+
+Inspected the backend (`products.go`, `categories.go`, `tags.go` `Bump` handlers): a bump only
+ever executes `UPDATE ... SET version = version+1, updated_at = datetime('now') WHERE id = ?` —
+no other column changes. The WS/`/sync` `SyncEvent` payload (`{type, entity_id, version,
+updated_at}`) is therefore already a complete description of what changed. There is also no
+`GET /products/:id` (or per-entity) route registered in `backend/main.go` to refetch a single
+entity even if one were wanted. So the implementation patches `version`/`updated_at` on the
+matching local entity in place and leaves every other field untouched — this is correct (not a
+shortcut), not just simplest, given what a bump actually mutates.
+
+### What was implemented
+
+- `store/productStore.ts`: added `patchVersioned` (flat list match-by-id, used for products and
+  tags) and `patchCategoryTree` (recursive match-by-id, since categories are returned as a
+  nested tree of roots/children, not a flat list) as small pure helper functions, plus a new
+  store action `applyEntityEvent(event: SyncEvent)` that dispatches to the right one based on
+  `event.type` (`product_bump` / `category_bump` / `tag_bump`) and patches only the matching
+  entity — no other entities, and no refetch of the list.
+- Both helpers guard `event.version <= item.version` and return the *same* array/object
+  reference untouched when that's true, so stale, duplicate, or out-of-order events are no-ops
+  and never downgrade newer local state. When nothing changes, `set()` is skipped entirely (the
+  reference-equality return lets the store detect this) so an ignored event costs nothing.
+- `app/(tabs)/index.tsx`: `handleSyncEvent` now calls `applyEntityEvent(event)` for the three
+  bump types instead of only logging; unrecognized event types (e.g. `order_update`, which the
+  `SyncEvent` type permits but this task didn't require handling) still fall through to a
+  `console.log` rather than being silently dropped.
+- The two helpers are written as standalone functions over the entity arrays/tree (not inlined
+  into the WS handler), so `applySync` — which already receives the same `SyncEvent[]` shape from
+  `GET /sync?since=` and currently only updates `lastSyncVersion` — can call the same functions
+  per-event later to reconcile a backlog on reconnect/foreground, without new merge logic. That
+  wiring itself was explicitly out of scope for this task and was not done.
+
+### Why no full catalog reload occurs
+
+`applyEntityEvent` never calls `api.getProducts`/`loadProducts`/`loadCategories`/`loadTags` or
+any other fetch — it only maps over the already-in-memory `products`/`categories`/`tags` arrays
+already held in the zustand store and replaces the single matching item. An entity bumped
+elsewhere that isn't currently loaded locally (e.g. not yet paginated in) is correctly left
+alone rather than fabricated from the event's partial metadata.
+
+### Tests performed
+
+- `npx tsc --noEmit` — passed with no errors.
+- `npx expo export --platform ios` — full production bundle succeeded (929 modules, no errors).
+- No physical device/simulator was available, so a live two-device WS test (bump a product on
+  one device, observe the other update without a full reload) was not performed directly. As a
+  substitute, the two pure merge functions (`patchVersioned`, `patchCategoryTree`) were copied
+  into a standalone Node script (outside the repo, in the session scratchpad) and exercised
+  against 12 assertions: normal version bump applies and preserves unrelated fields, a stale
+  (older) event is a no-op and does not downgrade, a duplicate (equal-version) event is a no-op,
+  an event for an id not present locally is a no-op, and the same three cases for a nested
+  category via the recursive tree walk. All 12 passed. This verifies the merge logic itself;
+  it does not substitute for an observed end-to-end WS round trip through a running app.

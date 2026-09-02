@@ -14,14 +14,25 @@ export default function ProductsScreen() {
   const router = useRouter();
   const { products, isLoading, nextCursor, loadNextPage } = useProducts();
   const addItem = useCartStore((s) => s.addItem);
-  const applySync = useProductStore((s) => s.applySync);
+  const applyEntityEvent = useProductStore((s) => s.applyEntityEvent);
   const [searchResults, setSearchResults] = useState<Product[] | null>(null);
 
   const displayProducts = searchResults ?? products;
 
-  const handleSyncEvent = useCallback((event: SyncEvent) => {
-    console.log('sync event', event);
-  }, []);
+  const handleSyncEvent = useCallback(
+    (event: SyncEvent) => {
+      if (
+        event.type === 'product_bump' ||
+        event.type === 'category_bump' ||
+        event.type === 'tag_bump'
+      ) {
+        applyEntityEvent(event);
+      } else {
+        console.log('unhandled sync event', event);
+      }
+    },
+    [applyEntityEvent]
+  );
 
   useWebSocket(handleSyncEvent);
 

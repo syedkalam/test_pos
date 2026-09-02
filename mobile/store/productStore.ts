@@ -3,6 +3,50 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { api } from '@/services/api';
 import type { Category, Product, SyncEvent, SyncResponse, Tag } from '@/types';
 
+interface VersionedEntity {
+  id: number;
+  version: number;
+  updated_at: string;
+}
+
+// A bump only ever changes `version`/`updated_at` server-side (see
+// backend products.go/categories.go/tags.go Bump handlers) and the WS/sync
+// event carries exactly that pair, so patching those two fields in place is
+// a complete, correct application of the event — no refetch of the entity
+// is needed. `event.version > item.version` guards against an out-of-order
+// or duplicate event undoing a newer local state.
+function patchVersioned<T extends VersionedEntity>(list: T[], event: SyncEvent): T[] {
+  let changed = false;
+  const next = list.map((item) => {
+    if (item.id !== event.entity_id || event.version <= item.version) return item;
+    changed = true;
+    return { ...item, version: event.version, updated_at: event.updated_at };
+  });
+  return changed ? next : list;
+}
+
+// Categories are a tree (list of roots with nested `children`), so matching
+// by id requires a recursive walk rather than a flat map.
+function patchCategoryTree(categories: Category[], event: SyncEvent): Category[] {
+  let changed = false;
+  const next = categories.map((cat) => {
+    if (cat.id === event.entity_id) {
+      if (event.version <= cat.version) return cat;
+      changed = true;
+      return { ...cat, version: event.version, updated_at: event.updated_at };
+    }
+    if (cat.children && cat.children.length > 0) {
+      const patchedChildren = patchCategoryTree(cat.children, event);
+      if (patchedChildren !== cat.children) {
+        changed = true;
+        return { ...cat, children: patchedChildren };
+      }
+    }
+    return cat;
+  });
+  return changed ? next : categories;
+}
+
 interface ProductState {
   products: Product[];
   categories: Category[];
@@ -17,6 +61,7 @@ interface ProductState {
   loadTags: () => Promise<void>;
   bumpProduct: (id: number, expectedVersion: number) => Promise<void>;
   applySync: (response: SyncResponse) => void;
+  applyEntityEvent: (event: SyncEvent) => void;
 }
 
 export const useProductStore = create<ProductState>((set, get) => ({
@@ -97,5 +142,31 @@ export const useProductStore = create<ProductState>((set, get) => ({
     ];
     const maxVersion = allEvents.reduce((max, e) => Math.max(max, e.version), get().lastSyncVersion);
     set({ lastSyncVersion: maxVersion });
+  },
+
+  applyEntityEvent: (event: SyncEvent) => {
+    switch (event.type) {
+      case 'product_bump': {
+        const products = patchVersioned(get().products, event);
+        if (products !== get().products) set({ products });
+        break;
+      }
+      case 'tag_bump': {
+        const tags = patchVersioned(get().tags, event);
+        if (tags !== get().tags) set({ tags });
+        break;
+      }
+      case 'category_bump': {
+        const categories = patchCategoryTree(get().categories, event);
+        if (categories !== get().categories) set({ categories });
+        break;
+      }
+      default:
+        break;
+    }
+
+    if (event.version > get().lastSyncVersion) {
+      set({ lastSyncVersion: event.version });
+    }
   },
 }));

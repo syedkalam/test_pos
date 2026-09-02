@@ -14,4 +14,6 @@
 * Fixed sync polling timer leak by properly clearing intervals.
 * Stabilized Products screen callbacks; no offline/realtime/conflict features implemented yet.
 
--
+-  Added full socket  flow , now manually testing if we are receving latest products and updates from the server, and if the app is sending updates to the server when products are updated in the app.  
+
+
