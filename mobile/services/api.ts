@@ -1,5 +1,5 @@
 import { API_URL, PAGE_SIZE } from '@/constants/config';
-import type { Category, Order, Product, ProductsResponse, SyncResponse, Tag } from '@/types';
+import type { Cart, Category, Order, Product, ProductsResponse, SyncResponse, Tag } from '@/types';
 
 class ApiClient {
   private baseUrl: string;
