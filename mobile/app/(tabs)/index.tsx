@@ -17,6 +17,7 @@ export default function ProductsScreen() {
   const addItem = useCartStore((s) => s.addItem);
   const applyEntityEvent = useProductStore((s) => s.applyEntityEvent);
   const syncSince = useProductStore((s) => s.syncSince);
+  const flushOutbox = useProductStore((s) => s.flushOutbox);
   const isSyncing = useProductStore((s) => s.isSyncing);
   const [searchResults, setSearchResults] = useState<Product[] | null>(null);
 
@@ -37,19 +38,20 @@ export default function ProductsScreen() {
     [applyEntityEvent]
   );
 
-  // Missed-change reconciliation: fired on WS reconnect (messages broadcast
-  // while disconnected were never delivered), app foreground (the socket
-  // may have been suspended by the OS while backgrounded), and offline ->
-  // online. All three funnel into the same store action, which guards
-  // against overlapping /sync calls if they fire together.
-  useWebSocket(handleSyncEvent, syncSince);
-
-  const handleForeground = useCallback(() => {
+  // Missed-change reconciliation AND outbox replay share the same recovery
+  // triggers: WS reconnect (messages broadcast while disconnected were never
+  // delivered), app foreground (the socket may have been suspended by the
+  // OS while backgrounded), and offline -> online. Each store action guards
+  // itself against overlapping calls, so firing both here is safe even if
+  // multiple triggers land together.
+  const handleReconnect = useCallback(() => {
     syncSince();
-  }, [syncSince]);
+    flushOutbox();
+  }, [syncSince, flushOutbox]);
 
-  useAppState(handleForeground);
-  useNetworkStatus(syncSince);
+  useWebSocket(handleSyncEvent, handleReconnect);
+  useAppState(handleReconnect);
+  useNetworkStatus(handleReconnect);
 
   const handleEndReached = useCallback(() => {
     if (!searchResults) loadNextPage();

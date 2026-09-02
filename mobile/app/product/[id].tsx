@@ -17,7 +17,10 @@ export default function ProductDetailScreen() {
 
   const handleBump = () => {
     if (!product) return;
-    bumpProduct(product.id, product.version);
+    // bumpProduct reads the current version from the store itself (not from
+    // this closure) so repeated taps — including while offline — chain
+    // correctly off the latest optimistic value instead of a stale prop.
+    bumpProduct(product.id);
   };
 
   if (!product) return <Text style={styles.error}>Product not found</Text>;

@@ -46,3 +46,22 @@
 - Trade-off: writes are debounced (~1.5s) so a burst of WS bumps collapses into one write instead
   of one per bump. If the app is killed inside that window, the last update(s) may not be on disk
   yet — acceptable, since `syncSince()` re-fetches anything missed on next launch/reconnect.
+
+## Offline bump outbox + conflict resolution
+
+- Persistent outbox: a product/category/tag bump made while offline (or when the request just
+  fails) is queued to AsyncStorage (`surat_outbox_v1`), written immediately (not debounced, unlike
+  the catalog cache) so an app kill right after tapping bump doesn't lose the pending intent.
+- Optimistic: the local version increments immediately for a responsive UI, whether online or
+  offline; the network attempt (or later replay) only ever reconciles that value, never
+  double-increments it.
+- Conflict strategy: server-authoritative + operation replay. A 409 means the server's
+  `current_version` is truth — the queued bump is retried against that version, not discarded, so
+  Device A's offline bump (v3) survives Device B racing ahead to v6 and still lands, ending at v7.
+- Why: a bump is a stateless "+1" operation, not a value to set, so replaying it against whatever
+  the server says is current is always safe and never loses user intent — simpler and more
+  faithful than trying to merge/rebase a value-based change.
+- Limitation: replay is capped (5 conflict retries per operation) to avoid looping forever under a
+  pathological back-to-back conflict storm; an op that exhausts this is rebased and retried on the
+  next reconnect instead of being dropped. Cart/order flows are unaffected — only entity bumps are
+  queued, as scoped.

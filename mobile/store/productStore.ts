@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { api } from '@/services/api';
+import { api, VersionConflictError } from '@/services/api';
 import type { Category, Product, SyncEvent, SyncResponse, Tag } from '@/types';
 
 interface VersionedEntity {
@@ -138,6 +138,186 @@ function persistNow(products: Product[], categories: Category[], tags: Tag[]) {
   AsyncStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify({ products, categories, tags })).catch(() => {});
 }
 
+// --- Offline bump outbox (AsyncStorage) ---
+// A bump is a single logical operation ("advance this entity's version by
+// one from what I last saw"), not a value to set — that's what makes
+// server-authoritative replay safe: on a 409 we simply adopt the server's
+// current_version and resend the SAME operation with that as the new
+// expected_version, and success always means "one bump landed."
+type EntityType = 'product' | 'category' | 'tag';
+
+interface OutboxOp {
+  opId: string;
+  entityType: EntityType;
+  entityId: number;
+  expectedVersion: number;
+  createdAt: string;
+}
+
+const OUTBOX_KEY = 'surat_outbox_v1';
+const MAX_CONFLICT_RETRIES = 5;
+
+async function readOutbox(): Promise<OutboxOp[]> {
+  try {
+    const raw = await AsyncStorage.getItem(OUTBOX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// The outbox is tiny (a handful of pending ops at most) and durability of
+// user intent matters more than write frequency here, unlike the catalog
+// cache — so every mutation is persisted immediately, no debounce.
+function persistOutboxNow(outbox: OutboxOp[]) {
+  AsyncStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox)).catch(() => {});
+}
+
+function addOutboxOp(outbox: OutboxOp[], op: OutboxOp): OutboxOp[] {
+  return [...outbox, op];
+}
+
+function removeOutboxOp(outbox: OutboxOp[], opId: string): OutboxOp[] {
+  return outbox.filter((o) => o.opId !== opId);
+}
+
+function updateOutboxOpVersion(outbox: OutboxOp[], opId: string, expectedVersion: number): OutboxOp[] {
+  return outbox.map((o) => (o.opId === opId ? { ...o, expectedVersion } : o));
+}
+
+// After an op for (entityType, entityId) resolves to `version`, the NEXT
+// still-queued op for the SAME entity (if any) was chained off the
+// pre-conflict local state and may now be stale — e.g. two offline bumps
+// queued expecting v4 then v5, but the first actually resolved to v7 after a
+// conflict retry. Rebasing the next op's expectedVersion onto the just-
+// resolved version keeps a multi-bump chain for one entity deterministic no
+// matter how many conflicts happened along the way.
+function rebaseNextOpForEntity(outbox: OutboxOp[], entityType: EntityType, entityId: number, version: number): OutboxOp[] {
+  const idx = outbox.findIndex((o) => o.entityType === entityType && o.entityId === entityId);
+  if (idx === -1 || outbox[idx].expectedVersion === version) return outbox;
+  const next = outbox.slice();
+  next[idx] = { ...next[idx], expectedVersion: version };
+  return next;
+}
+
+function findEntityVersion(
+  state: { products: Product[]; categories: Category[]; tags: Tag[] },
+  entityType: EntityType,
+  id: number
+): number | undefined {
+  if (entityType === 'product') return state.products.find((p) => p.id === id)?.version;
+  if (entityType === 'tag') return state.tags.find((t) => t.id === id)?.version;
+  const find = (cats: Category[]): Category | undefined => {
+    for (const c of cats) {
+      if (c.id === id) return c;
+      if (c.children && c.children.length > 0) {
+        const found = find(c.children);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  };
+  return find(state.categories)?.version;
+}
+
+// Sets an entity's version directly (an exact value, not a +1 patch) — used
+// both to apply an optimistic bump and to reconcile a server-confirmed
+// result. Guarded the same way as the WS/sync patch functions above: never
+// downgrades, so a slower-resolving bump can't stomp a version a WS event or
+// another resolution already advanced past it.
+function withEntityVersion(
+  state: { products: Product[]; categories: Category[]; tags: Tag[] },
+  entityType: EntityType,
+  id: number,
+  version: number
+): Partial<Pick<ProductState, 'products' | 'categories' | 'tags'>> {
+  if (entityType === 'product') {
+    const current = state.products.find((p) => p.id === id);
+    if (!current || version <= current.version) return {};
+    return { products: state.products.map((p) => (p.id === id ? { ...p, version } : p)) };
+  }
+  if (entityType === 'tag') {
+    const current = state.tags.find((t) => t.id === id);
+    if (!current || version <= current.version) return {};
+    return { tags: state.tags.map((t) => (t.id === id ? { ...t, version } : t)) };
+  }
+  const patch = (cats: Category[]): { next: Category[]; changed: boolean } => {
+    let changed = false;
+    const next = cats.map((c) => {
+      if (c.id === id) {
+        if (version <= c.version) return c;
+        changed = true;
+        return { ...c, version };
+      }
+      if (c.children && c.children.length > 0) {
+        const child = patch(c.children);
+        if (child.changed) {
+          changed = true;
+          return { ...c, children: child.next };
+        }
+      }
+      return c;
+    });
+    return { next, changed };
+  };
+  const result = patch(state.categories);
+  return result.changed ? { categories: result.next } : {};
+}
+
+function bumpApiFor(entityType: EntityType) {
+  if (entityType === 'product') return api.bumpProduct.bind(api);
+  if (entityType === 'category') return api.bumpCategory.bind(api);
+  return api.bumpTag.bind(api);
+}
+
+type BumpAttemptOutcome =
+  | { status: 'success'; version: number }
+  | { status: 'conflict'; currentVersion: number }
+  | { status: 'network_error' };
+
+async function attemptBump(entityType: EntityType, id: number, expectedVersion: number): Promise<BumpAttemptOutcome> {
+  try {
+    const result = await bumpApiFor(entityType)(id, expectedVersion);
+    return { status: 'success', version: result.version };
+  } catch (e) {
+    if (e instanceof VersionConflictError) {
+      return { status: 'conflict', currentVersion: e.currentVersion };
+    }
+    // Any other failure (offline, timeout, 5xx) is treated as "request
+    // cannot complete" — the caller queues it rather than discarding it, per
+    // the requirement not to silently drop the user's intended bump.
+    return { status: 'network_error' };
+  }
+}
+
+type ResolveOutcome =
+  | { status: 'success'; version: number }
+  | { status: 'network_error' }
+  | { status: 'gave_up'; currentVersion: number };
+
+// Server-authoritative + operation replay: a 409 means the server's version
+// is the truth, not ours, so we adopt current_version and retry the SAME
+// bump against it rather than abandoning it. Bounded so a pathological
+// back-to-back conflict storm can't loop forever inline; a `gave_up` result
+// still carries the last known server version so the caller can queue the
+// operation for the next reconnect instead of losing it.
+async function resolveBumpWithRetry(entityType: EntityType, id: number, expectedVersion: number): Promise<ResolveOutcome> {
+  let expected = expectedVersion;
+  for (let attempt = 0; attempt < MAX_CONFLICT_RETRIES; attempt++) {
+    const outcome = await attemptBump(entityType, id, expected);
+    if (outcome.status === 'success') return outcome;
+    if (outcome.status === 'network_error') return outcome;
+    expected = outcome.currentVersion;
+  }
+  return { status: 'gave_up', currentVersion: expected };
+}
+
+function makeOpId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 interface ProductState {
   products: Product[];
   categories: Category[];
@@ -148,18 +328,73 @@ interface ProductState {
   nextCursor: string | null;
   lastSyncVersion: number;
   error: string | null;
+  outbox: OutboxOp[];
+  isFlushingOutbox: boolean;
   initialize: () => Promise<void>;
   loadProducts: () => Promise<void>;
   loadNextPage: () => Promise<void>;
   loadCategories: () => Promise<void>;
   loadTags: () => Promise<void>;
-  bumpProduct: (id: number, expectedVersion: number) => Promise<void>;
+  bumpProduct: (id: number) => Promise<void>;
+  bumpCategory: (id: number) => Promise<void>;
+  bumpTag: (id: number) => Promise<void>;
+  flushOutbox: () => Promise<void>;
   applySync: (response: SyncResponse) => void;
   applyEntityEvent: (event: SyncEvent) => void;
   syncSince: () => Promise<void>;
 }
 
-export const useProductStore = create<ProductState>((set, get) => ({
+export const useProductStore = create<ProductState>((set, get) => {
+  // Shared by bumpProduct/bumpCategory/bumpTag: applies the optimistic
+  // local increment immediately (responsive UI, offline or not), then tries
+  // the server. A network failure queues the op for later replay; a
+  // conflict is resolved inline via resolveBumpWithRetry (server-
+  // authoritative + retry) since the device is clearly online right now.
+  const performBump = async (entityType: EntityType, id: number) => {
+    const expectedVersion = findEntityVersion(get(), entityType, id);
+    if (expectedVersion === undefined) return;
+    const optimisticVersion = expectedVersion + 1;
+
+    set(withEntityVersion(get(), entityType, id, optimisticVersion));
+    schedulePersist(get().products, get().categories, get().tags);
+
+    const outcome = await resolveBumpWithRetry(entityType, id, expectedVersion);
+
+    if (outcome.status === 'success') {
+      set(withEntityVersion(get(), entityType, id, outcome.version));
+      schedulePersist(get().products, get().categories, get().tags);
+      return;
+    }
+
+    if (outcome.status === 'network_error') {
+      const op: OutboxOp = {
+        opId: makeOpId(),
+        entityType,
+        entityId: id,
+        expectedVersion,
+        createdAt: new Date().toISOString(),
+      };
+      set({ outbox: addOutboxOp(get().outbox, op) });
+      persistOutboxNow(get().outbox);
+      return;
+    }
+
+    // gave_up: repeated live conflicts (rare). Still preserve the user's
+    // intended bump — rebase it onto the last known server version and let
+    // the normal reconnect/replay path finish it, rather than discarding it.
+    set(withEntityVersion(get(), entityType, id, outcome.currentVersion + 1));
+    const op: OutboxOp = {
+      opId: makeOpId(),
+      entityType,
+      entityId: id,
+      expectedVersion: outcome.currentVersion,
+      createdAt: new Date().toISOString(),
+    };
+    set({ outbox: addOutboxOp(get().outbox, op) });
+    persistOutboxNow(get().outbox);
+  };
+
+  return {
   products: [],
   categories: [],
   tags: [],
@@ -169,6 +404,8 @@ export const useProductStore = create<ProductState>((set, get) => ({
   nextCursor: null,
   lastSyncVersion: 0,
   error: null,
+  outbox: [],
+  isFlushingOutbox: false,
 
   // Single startup entry point: check for a cached catalog before making any
   // network call. A cache hit renders immediately and only needs a delta
@@ -177,7 +414,9 @@ export const useProductStore = create<ProductState>((set, get) => ({
   // usable local baseline, so it falls back to the full paginated load.
   initialize: async () => {
     if (get().hydrated) return;
-    const cached = await readCachedCatalog();
+    const [cached, storedOutbox] = await Promise.all([readCachedCatalog(), readOutbox()]);
+    if (storedOutbox.length > 0) set({ outbox: storedOutbox });
+
     // Guard against a race with live data: if products/categories/tags are
     // no longer empty (e.g. a WS event or another load already landed while
     // this AsyncStorage read was in flight), the cache is stale by
@@ -198,6 +437,12 @@ export const useProductStore = create<ProductState>((set, get) => ({
       set({ hydrated: true });
       await Promise.all([get().loadProducts(), get().loadCategories(), get().loadTags()]);
     }
+
+    // Replay any bump(s) queued before this launch (e.g. the app was killed
+    // while offline with a pending outbox item). Same flush path used for a
+    // live reconnect — a no-op if the outbox is empty, and it stops cleanly
+    // without losing anything if the device is still offline.
+    get().flushOutbox();
   },
 
   loadProducts: async () => {
@@ -256,17 +501,49 @@ export const useProductStore = create<ProductState>((set, get) => ({
     }
   },
 
-  bumpProduct: async (id: number, expectedVersion: number) => {
+  bumpProduct: (id: number) => performBump('product', id),
+  bumpCategory: (id: number) => performBump('category', id),
+  bumpTag: (id: number) => performBump('tag', id),
+
+  // Drains the outbox strictly in FIFO order, one operation at a time (never
+  // concurrently — see isFlushingOutbox guard) so a multi-bump chain for the
+  // same entity replays deterministically. Stops (without dropping anything)
+  // on the first network failure, since that means we're offline again and
+  // the remaining ops simply wait for the next reconnect signal.
+  flushOutbox: async () => {
+    if (get().isFlushingOutbox || get().outbox.length === 0) return;
+    set({ isFlushingOutbox: true });
     try {
-      const result = await api.bumpProduct(id, expectedVersion);
-      set((state) => ({
-        products: state.products.map((p) =>
-          p.id === id ? { ...p, version: result.version } : p
-        ),
-      }));
-      schedulePersist(get().products, get().categories, get().tags);
-    } catch (e) {
-      console.error('Bump failed', e);
+      while (get().outbox.length > 0) {
+        const op = get().outbox[0];
+        const outcome = await resolveBumpWithRetry(op.entityType, op.entityId, op.expectedVersion);
+
+        if (outcome.status === 'network_error') break;
+
+        if (outcome.status === 'gave_up') {
+          // Rebase this op onto the last known server version and try again
+          // on the next reconnect rather than looping forever right now.
+          set({ outbox: updateOutboxOpVersion(get().outbox, op.opId, outcome.currentVersion) });
+          persistOutboxNow(get().outbox);
+          break;
+        }
+
+        // success: reconcile the entity to the confirmed version, drop this
+        // op, and rebase any later queued op for the same entity onto it.
+        set(withEntityVersion(get(), op.entityType, op.entityId, outcome.version));
+        set({
+          outbox: rebaseNextOpForEntity(
+            removeOutboxOp(get().outbox, op.opId),
+            op.entityType,
+            op.entityId,
+            outcome.version
+          ),
+        });
+        schedulePersist(get().products, get().categories, get().tags);
+        persistOutboxNow(get().outbox);
+      }
+    } finally {
+      set({ isFlushingOutbox: false });
     }
   },
 
@@ -348,4 +625,5 @@ export const useProductStore = create<ProductState>((set, get) => ({
       set({ isSyncing: false });
     }
   },
-}));
+  };
+});
