@@ -8,5 +8,4 @@ const HOST = Platform.OS === 'android' ? '10.0.2.2' : 'localhost';
 
 export const API_URL = `http://${HOST}:8080`;
 export const WS_URL = `ws://${HOST}:8080`;
-export const POLL_INTERVAL_MS = 5000;
 export const PAGE_SIZE = 50;

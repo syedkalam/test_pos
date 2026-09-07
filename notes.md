@@ -65,3 +65,22 @@
   pathological back-to-back conflict storm; an op that exhausts this is rebased and retried on the
   next reconnect instead of being dropped. Cart/order flows are unaffected — only entity bumps are
   queued, as scoped.
+
+## Reliability/performance cleanup
+
+- Search had no debounce, no cancellation, and no protection against out-of-order responses — a
+  slow response to an earlier keystroke could overwrite a newer query's results. Fixed with a
+  300ms debounce, an AbortController per request, and a request-id guard that drops any response
+  that isn't the latest.
+- `ProductCard` held an unbounded module-level `Map` caching an image URL that's a pure function
+  of `product.id` — a plain memory leak with no benefit. Removed; the URL is computed inline.
+- Products list was missing a stable `keyExtractor` and re-created `renderItem`/`onPress` on every
+  render, defeating any memoization. Added `keyExtractor`, wrapped `ProductCard` in `React.memo`,
+  and stabilized the callbacks passed to it.
+- `useProducts`/Categories screen subscribed to the entire product/category store instead of the
+  specific fields used, causing re-renders on unrelated state changes (e.g. outbox/sync activity).
+  Switched to per-field selectors. Categories screen also now goes through the same `initialize()`
+  entry point as Products instead of an ad hoc `loadCategories()` that bypassed offline-cache
+  hydration and outbox replay if Categories was opened first.
+- Removed dead code left over from the pre-WebSocket sync design: `useSyncPoller` (interval
+  polling, superseded by WS + reconnect sync) and `syncStore` (unused) were unreferenced anywhere.

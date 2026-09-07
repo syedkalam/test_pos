@@ -4,11 +4,17 @@ import { CategoryTree } from '@/components/CategoryTree';
 import { useProductStore } from '@/store/productStore';
 
 export default function CategoriesScreen() {
-  const { categories, loadCategories } = useProductStore();
+  const categories = useProductStore((s) => s.categories);
+  const initialize = useProductStore((s) => s.initialize);
   const [selectedId, setSelectedId] = useState<number | undefined>();
 
+  // Route through the same single entry point as the Products tab (guarded
+  // by `hydrated`, so a call after the app is already initialized is a
+  // no-op) instead of a standalone loadCategories() — visiting Categories
+  // before Products would otherwise bypass offline cache hydration and
+  // outbox replay entirely.
   useEffect(() => {
-    if (categories.length === 0) loadCategories();
+    initialize();
   }, []);
 
   return (

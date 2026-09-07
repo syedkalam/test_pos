@@ -48,8 +48,8 @@ class ApiClient {
     return res.json();
   }
 
-  async searchProducts(query: string): Promise<Product[]> {
-    const res = await fetch(`${this.baseUrl}/products?search=${encodeURIComponent(query)}&limit=20`);
+  async searchProducts(query: string, signal?: AbortSignal): Promise<Product[]> {
+    const res = await fetch(`${this.baseUrl}/products?search=${encodeURIComponent(query)}&limit=20`, { signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json().then((r: ProductsResponse) => r.data);
   }

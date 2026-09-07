@@ -64,6 +64,23 @@ export default function ProductsScreen() {
     [addItem]
   );
 
+  // Stable references so ProductCard's React.memo (see components/ProductCard.tsx)
+  // is actually effective — an inline arrow defined inside renderItem would
+  // get a new identity on every render regardless of memoization.
+  const handlePress = useCallback(
+    (product: Product) => router.push(`/product/${product.id}`),
+    [router]
+  );
+
+  const renderItem = useCallback(
+    ({ item }: { item: Product }) => (
+      <ProductCard product={item} onPress={handlePress} onAddToCart={handleAddToCart} />
+    ),
+    [handlePress, handleAddToCart]
+  );
+
+  const keyExtractor = useCallback((item: Product) => String(item.id), []);
+
   return (
     <View style={styles.container}>
       <SearchBar onResults={(r) => setSearchResults(r.length > 0 ? r : null)} />
@@ -81,13 +98,8 @@ export default function ProductsScreen() {
           )}
           <FlatList
             data={displayProducts}
-            renderItem={({ item }) => (
-              <ProductCard
-                product={item}
-                onPress={(p) => router.push(`/product/${p.id}`)}
-                onAddToCart={handleAddToCart}
-              />
-            )}
+            keyExtractor={keyExtractor}
+            renderItem={renderItem}
             onEndReached={handleEndReached}
             onEndReachedThreshold={0.3}
             ListFooterComponent={isLoading ? <ActivityIndicator color="#1976d2" /> : null}

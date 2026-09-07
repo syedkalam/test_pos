@@ -2,20 +2,19 @@ import React from 'react';
 import { View, Text, Image, StyleSheet, TouchableOpacity } from 'react-native';
 import type { Product } from '@/types';
 
-const imageCache = new Map<string, string>();
-
 interface Props {
   product: Product;
   onPress?: (product: Product) => void;
   onAddToCart?: (product: Product) => void;
 }
 
-export function ProductCard({ product, onPress, onAddToCart }: Props) {
-  const key = String(product.id);
-  if (!imageCache.has(key)) {
-    imageCache.set(key, `https://picsum.photos/seed/${product.id}/300/200`);
-  }
-  const imageUrl = imageCache.get(key)!;
+// The image URL is a pure function of product.id — recomputing it is a
+// cheap string interpolation, not a network/IO cost, so there is nothing
+// worth memoizing it against. The previous module-level Map cached this for
+// every product ID ever rendered for the lifetime of the app with no
+// eviction, which is a plain memory leak for no benefit.
+function ProductCardImpl({ product, onPress, onAddToCart }: Props) {
+  const imageUrl = `https://picsum.photos/seed/${product.id}/300/200`;
 
   return (
     <TouchableOpacity style={styles.card} onPress={() => onPress?.(product)}>
@@ -40,6 +39,12 @@ export function ProductCard({ product, onPress, onAddToCart }: Props) {
     </TouchableOpacity>
   );
 }
+
+// Memoized so a re-render of the Products list (e.g. from an unrelated
+// store field changing) doesn't re-render every card — only cards whose
+// `product`/`onPress`/`onAddToCart` prop actually changed re-render, as long
+// as callers pass stable callback references (see (tabs)/index.tsx).
+export const ProductCard = React.memo(ProductCardImpl);
 
 const styles = StyleSheet.create({
   card: { flexDirection: 'row', backgroundColor: '#fff', borderRadius: 8, marginBottom: 8, overflow: 'hidden', elevation: 2, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 4 },
